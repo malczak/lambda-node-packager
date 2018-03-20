@@ -1,0 +1,17 @@
+{
+  "name": "lambda-node-packager",
+  "version": "1.0.0",
+  "description": "Lambda node packager",
+  "main": "index.js",
+  "scripts": {
+  },
+  "author": "Matt",
+  "license": "MIT",
+  "repository": "https://github.com/malczak/lambda-node-packager",
+  "devDependencies": {
+    "aws-sdk": "^2.211.0"
+  },
+  "dependencies": {
+    "archiver": "^2.1.1"
+  }
+}
