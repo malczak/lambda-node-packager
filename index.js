@@ -1,7 +1,7 @@
 const AWS = require('aws-sdk');
-const fs = require('fs');
 const childProcess = require('child_process');
 const crypto = require('crypto');
+const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const util = require('util');
@@ -38,6 +38,7 @@ const archiveNameTemplate = 'archived-${projectName}';
  * Create node_modules archive, cached in s3 based on dependencies hash
  */
 async function archiveModules(opts) {
+    const packageFolder = 'package-modules';
     const {source, cacheUri = null, keep = false} = opts;
     const logInfo = opts.logInfo || (function () {process.stdout.write(util.format.apply(util, arguments) + '\n');});
     const packageJson = (typeof source == 'string') ? JSON.parse(source.endsWith('.json') ? fs.readFileSync(source, 'utf8') : source) : source;
@@ -46,14 +47,13 @@ async function archiveModules(opts) {
     let s3 = null;
 
     // Create tmp package dir
-    const workDir = opts.workDir || fs.mkdtempSync(path.join(os.tmpdir(), 'modules-'));
-    const pckgDir = path.join(workDir, 'package-modules');
-    try {
-        fs.statSync(pckgDir);
-    } catch (error) {
-        fs.mkdirSync(pckgDir);
-    }
-    logInfo(`working dir set to '${workDir}'`);
+    const ownsWorkDir = opts.workDir == null;
+    const workDir = ownsWorkDir ? fs.mkdtempSync(path.join(os.tmpdir(), 'modules-')) : opts.workDir;
+    const pckgDir = path.join(workDir, packageFolder);
+    const installDir = path.join(pckgDir, 'npm');
+    utils.mkdir(pckgDir);
+    utils.mkdir(installDir);
+    logInfo(`working dir set to '${workDir}'; owns = ${ownsWorkDir ? 'Y' : 'N'}`);
 
     // remove known dependencies (eq. 'aws-sdk')
     const clearedPackage = utils.removePreinstalledModules(packageJson);
@@ -64,8 +64,7 @@ async function archiveModules(opts) {
 
     // Crete archive name
     const archiveName = `${utils.substitute(modulesNameTemplate, {projectName, checksum})}.tgz`;
-    const archivePath = path.join(workDir, archiveName);
-
+    const archivePath = path.join(pckgDir, archiveName);
 
     // If cache is enabled, try to get it
     let foundInCache = false;
@@ -78,13 +77,11 @@ async function archiveModules(opts) {
         try {
             let response = await s3[operation](cache).promise();
 
-            logInfo('Archive found in cache');
+            logInfo('archive found in cache');
 
             // write to file and unarchive
             if (response.Body) {
-                logInfo('Saving archive from cache');
                 fs.writeFileSync(archivePath, response.Body);
-                utils.untar(archivePath, workDir);
             }
 
             foundInCache = true;
@@ -94,7 +91,7 @@ async function archiveModules(opts) {
     }
 
     if (!foundInCache) {
-        const packagePath = path.join(pckgDir, 'package.json');
+        const packagePath = path.join(installDir, 'package.json');
 
         // save package.json
         logInfo(`updating package config; file = '${packagePath}'`);
@@ -102,11 +99,12 @@ async function archiveModules(opts) {
 
         // run `npm install --production --no-optional`
         logInfo('installing all dependencies');
-        childProcess.execSync(`export HOME='${pckgDir}' && npm install --quiet --production --no-optional`, {cwd: pckgDir});
+        childProcess.execSync(`export HOME='${installDir}' && npm install --quiet --production --no-optional`, {cwd: installDir});
 
         // Compress archive node_modules -> targz
         logInfo('creating node_modules archive');
-        utils.tar(path.join(pckgDir, 'node_modules'), archivePath);
+        const output = path.join(installDir, 'node_modules');
+        utils.tar(output, archivePath);
 
         // if using cache, upload it
         if (cache) {
@@ -120,13 +118,12 @@ async function archiveModules(opts) {
         }
     }
 
-    if (!keep) {
-        // cleanup
-        fs.unlinkSync(workDir);
-    } else {
-        logInfo(`Intermediate files saved; path = ${workDir}`);
+    if (keep) {
+        logInfo(`modules left in '${workDir}'`);
+        utils.untar(archivePath, workDir);
     }
 
+    childProcess.execSync(`rm -rf ${packageFolder}`, {cwd: workDir});
     return archiveName;
 }
 
@@ -138,44 +135,41 @@ async function archiveModules(opts) {
 */
 function archiveProject(opts) {
     // this should be run once per container
-    const {sourceUri, targetUri, cacheUri, disableUpload} = opts;
+    const {sourceUri, targetUri, cacheUri, keep = false} = opts;
     const logInfo = opts.logInfo || (function () {process.stdout.write(util.format.apply(util, arguments) + '\n');});
 
-    const source = utils.parseS3URI(sourceUri);
-    const target = utils.parseS3URI(targetUri);
+    const source = utils.parseS3URI(sourceUri) || sourceUri;
 
-    const inFileName = source.Key.match(/[^/]*.tgz$/g)[0];
+    const inFileName = (source.Key || source).match(/[^/]*.tgz$/g)[0];
     if (!inFileName) {
         const err = new Error('Expected package name \'[a-zA-Z0-9\\-\\.]*.tgz\'');
         return Promise.reject(err);
     }
-    const outkey = opts.outkey || source.Key.replace(/\.[^.]*$/,'.zip');
+
+    const outFileName = inFileName.replace(/\.[^.]*$/,'.zip');
+    const targetFileUri = targetUri.endsWith('.zip') ? targetUri : `${targetUri}/${outFileName}`.replace(/^\/+/, '');
+    const target = utils.parseS3URI(targetFileUri) || targetFileUri;
 
     // create tmp dir structure /tmp/packager-xxx/package
-    logInfo('creating working directory');
     const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'packager-'));
     const pckgDir = path.join(rootDir, 'package');
+    logInfo(`working dir set to '${rootDir}'`);
 
     return fetchProject(source)
         .then(buildModules)
         .then(createArchive)
         .then(uploadPackage)
         .then(result => {
-            cleanup();
+            if (!keep) cleanup();
             return result;
-        })
-        .catch(error => {
-            cleanup();
-            throw error;
         });
 
     function fetchProject(source) {
+        const sourceIsS3 = (typeof source != 'string');
         const filePath = path.join(rootDir, inFileName);
         let getPackage = null;
 
-        // on lambda fetch file from S3
-        const isLambda = !!((process.env.LAMBDA_TASK_ROOT && process.env.AWS_EXECUTION_ENV) || false);
-        if (isLambda) {
+        if (sourceIsS3) {
             // Fetch package created with `npm pack`
             logInfo(`downloading package archive from s3://${source.Bucket}/${source.Key}`);
             const s3 = new AWS.S3();
@@ -197,38 +191,46 @@ function archiveProject(opts) {
 
     function buildModules() {
         const packagePath = path.join(pckgDir, 'package.json');
+        const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+        const projectName = packageJson.name.replace(/\s+/, '-');
         return archiveModules({
-            source: packagePath,
+            source: packageJson,
             workDir: pckgDir,
             cacheUri,
             keep: true
         }).then(modules => {
-            return modules;
+            return {projectName, modules};
         });
     }
 
-    function createArchive() {
-        const archiveName = `${utils.substitute(archiveNameTemplate, {projectName: '???'})}.zip`;
+    function createArchive(opts) {
+        const {projectName} = opts;
+        const archiveName = `${utils.substitute(archiveNameTemplate, {projectName})}.zip`;
         const archivePath = path.join(rootDir, archiveName);
-        logInfo(`archiving lambda; file = ${archiveName}`);
+        logInfo(`archiving project code; file = ${archivePath}`);
         return utils.zip(pckgDir, archivePath);
     }
 
     function uploadPackage(archivePath) {
-        if (disableUpload === false) {
+        let promise = null;
+
+        const targetIsS3 = (typeof target != 'string');
+        if (targetIsS3) {
             // upload package to S3
             const s3 = new AWS.S3();
             logInfo(`uploading '${archivePath}' to s3://${target.Bucket}/${target.Key}`);
-            return s3.upload({
+            promise = s3.upload({
                 Bucket: target.Bucket,
                 Key: target.Key,
                 Body: fs.createReadStream(archivePath)
             }).promise();
         } else {
             // copy file to local
-            logInfo(`saving archive; file = ${outkey}`);
-            return utils.copyFile(archivePath, outkey);
+            logInfo(`saving archive; file = ${target}`);
+            promise = utils.copyFile(archivePath, target);
         }
+
+        return promise.then(() => targetFileUri);
     }
 
     function cleanup() {

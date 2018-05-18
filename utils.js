@@ -1,5 +1,6 @@
-const fs = require('fs');
 const childProcess = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 const ZIP_CMD = './ec2_zip';
 const MODULES = ['aws-sdk'];
@@ -104,8 +105,12 @@ function removePreinstalledModules(packageJson) {
 function zip(source, target) {
     const sourceName = path.basename(source);
     try {
-        fs.statSync(ZIP_CMD);
-        childProcess.execSync(`${ZIP_CMD} -qr ${sourceName}`, {cwd: path.dirname(source)});
+        let zipExec = path.resolve(__dirname, ZIP_CMD);
+        fs.statSync(zipExec);
+        let result = childProcess.spawnSync(zipExec,['-qr', sourceName], {cwd: path.dirname(source)});
+        if (result != 0) {
+            throw new Error(result.stderr.toString('utf8'));
+        }
         return Promise.resolve(target);
     } catch (err) {
         // zip not available, try `archiver`
@@ -153,6 +158,20 @@ function untar(source, target = '.') {
     childProcess.execSync(`tar -xzf ${source} -C ${target}`, {cwd: path.dirname(source)});
 }
 
+/**
+ * Creates a directory
+ */
+function mkdir(path) {
+    try {
+        let stat = fs.statSync(path);
+        if (!stat.isDirectory()) {
+            fs.unlinkSync(path);
+        }
+    } catch (error) {
+        fs.mkdirSync(path);
+    }
+}
+
 module.exports = {
     parseS3URI,
     substitute,
@@ -162,5 +181,6 @@ module.exports = {
     removePreinstalledModules,
     zip,
     tar,
-    untar
+    untar,
+    mkdir
 };
